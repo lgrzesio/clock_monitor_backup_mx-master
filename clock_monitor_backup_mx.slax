@@ -1,0 +1,144 @@
+/*
+Copyright 2023 Juniper Networks, Inc. All rights reserved.
+Licensed under the Juniper Networks Script Software License (the "License").
+You may not use this script file except in compliance with the License, which is located at
+http://www.juniper.net/support/legal/scriptlicense/
+Unless required by applicable law or otherwise agreed to in writing by the parties,
+software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
+ OR CONDITIONS OF ANY KIND, either express or implied.
+
+Version 1.3
+2023-7-4
+Author nfujita
+Target Platform MX240/480/960/2010/2020
+SCBE3 is supported (v.1.2)
+specified timeout (-t) to rsh in the case backup RE doesn't responds
+
+- Description
+ This script periodically checks 19.44MHz central clock failure on backup CB.
+
+- Installation;
+ - Copy this file as /var/db/scripts/event/clock_monitor_backup_mx.slax under both REs.
+
+ - Configuration.
+set event-options event-script file clock_monitor_backup_mx.slax
+
+ - Recommended optional configuration
+set event-options event-script optional
+set system scripts synchronize
+
+*/
+
+version 1.1;
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+ns bit extension = "http://xml.libslax.org/bit";
+import "../import/junos.xsl";
+
+var $event-definition = {
+            <event-options> {
+                <generate-event> {
+                    <name>"1H_clock_monitor_backup_mx";
+                    <time-interval>"3600";
+                }
+                <policy> {
+                    <name>"clock_monitor_backup_mx";
+                    <events>"1H_clock_monitor_backup_mx";
+                    <then> {
+                        <event-script> {
+                            <name>"clock_monitor_backup_mx.slax";
+                        }
+                    }
+                }
+        }
+}
+
+var $con = jcs:open();
+var $msg=$script _ ": 19.44 MHz clock failure on backup CB";
+/* how to check
+acb
+rsh -Ji backup cbc -a | grep DPC_CLK_DETECT | awk '{print $3}'
+#define ACB_19MHZ_DETECT                    (1 << 26)
+
+acb with SCBE3
+rsh -Ji backup sysctl debug.scon_19m_clk_good|awk '{print $2}'
+0 means clock failure
+
+
+tcb
+rsh -Ji backup cbc -a | grep DPC_PRI_CLK_DETECT | awk '{print $3}'
+#define TCB_19MHZ_DETECT                    (1 << 22)
+*/
+
+template ckbit($bval,$bmask) {
+  var $res=bit:to-int(bit:and($bval,$bmask));
+  if ( $res > 0 ) {
+    expr 1;
+  } else {
+    expr 0;
+  }
+
+}
+
+template acb_backup_clk_check() {
+  var $rpc=<request-shell-execute> {
+    <command>"rsh -Ji -t5 backup cbc -a | grep DPC_CLK_DETECT | awk '{print $3}'";
+  }
+  var $bval=bit:from-hex(jcs:execute($con,$rpc),32);
+  var $bmask=bit:from-hex("0x4000000",32);
+  var $res={call ckbit($bval=$bval,$bmask=$bmask);}
+  if ($res == 0) {
+    expr jcs:syslog("daemon.error",$msg);
+  }
+}
+
+template scbe3_backup_clk_check() {
+  var $rpc=<request-shell-execute> {
+    <command>"rsh -Ji -t5 backup sysctl debug.scon_19m_clk_good|awk '{print $2}'";
+  }
+  var $res = normalize-space(jcs:execute($con,$rpc));
+  if ($res == 0) {
+    expr jcs:syslog("daemon.error",$msg);
+  }
+}
+
+template tcb_backup_clk_check() {
+  var $rpc=<request-shell-execute> {
+    <command>"rsh -Ji -t5 backup cbc -a | grep DPC_PRI_CLK_DETECT | awk '{print $3}'";
+  }
+  var $bval=bit:from-hex(jcs:execute($con,$rpc),32);
+  var $bmask=bit:from-hex("0x400000",32);
+  var $res={call ckbit($bval=$bval,$bmask=$bmask);}
+  if ($res == 0) {
+    expr jcs:syslog("daemon.error",$msg);
+  }
+}
+
+
+match / {
+ <op-script-result> {
+  if ($junos-context/re-master) {
+    var $ore-alive=jcs:sysctl("hw.ore.alive","i");
+    if ( $ore-alive == 1 ) {
+      var $model=jcs:sysctl("hw.product.model","s");
+      if (       ($model=="mx240")
+        or       ($model=="mx480")
+        or       ($model=="mx960")) {
+        var $rpc-ch=<request-shell-execute> {
+          <command>"cbc |& grep SCBE3| wc -l";
+        }
+        var $res-ch = normalize-space(jcs:execute($con,$rpc-ch));
+        if ($res-ch == 0) {
+          call acb_backup_clk_check();
+        } else {
+          call scbe3_backup_clk_check();
+        }
+      } else if (($model=="mx2020")
+        or       ($model=="mx2010")) {
+        call tcb_backup_clk_check();
+      }
+    }
+  }
+ }
+}
